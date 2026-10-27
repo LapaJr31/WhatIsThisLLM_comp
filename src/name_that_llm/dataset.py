@@ -10,7 +10,9 @@ from typing import Any, cast
 
 DATA_DIR = (Path(__file__).resolve().parent / "../datasets").resolve()
 
-class LLMDataset(Dataset[tuple[torch.Tensor, str]]):
+BATCH_SIZE = 512
+
+class LLMDataset(Dataset[tuple[torch.Tensor, torch.Tensor, int]]):
     def __init__(self, data: str):
 
         path = DATA_DIR / data
@@ -29,30 +31,38 @@ class LLMDataset(Dataset[tuple[torch.Tensor, str]]):
 
         dataset = pd.read_parquet(path, engine="pyarrow")
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         tokenizer = cast(Any, AutoTokenizer.from_pretrained("answerdotai/ModernBERT-base"))
 
         self.text = dataset["text"].astype(str).tolist()
         self.labels: list[str] = dataset["model"].astype(str).tolist()
 
+        self.label_names = sorted(set(self.labels))
+        self.label_to_id = {name: i for i, name in enumerate(self.label_names)}
+        self.label_ids = [self.label_to_id[label] for label in self.labels]
 
         if encoded_path.is_file():
             encoded = torch.load(encoded_path, map_location="cpu", weights_only=True)
         else:
-            encoded = tokenizer(
-                self.text,
-                truncation=True,
-                padding=True,
-                return_tensors="pt",
-            )
-            torch.save(dict(encoded), encoded_path)
+            encoded = {
+                "input_ids": [],
+                "attention_mask": [],
+            }
+            for start in range(0, len(self.text), BATCH_SIZE):
+                batch = tokenizer(
+                    self.text[start : start + BATCH_SIZE],
+                    truncation=True,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                encoded["input_ids"].append(batch["input_ids"])
+                encoded["attention_mask"].append(batch["attention_mask"])
+            torch.save(encoded, encoded_path)
 
-
-        self.input_ids = encoded["input_ids"]
-        self.attention_mask = encoded["attention_mask"]
+        self.input_ids = torch.cat(encoded["input_ids"])
+        self.attention_mask = torch.cat(encoded["attention_mask"])
 
     def __len__(self) -> int:
         return len(self.text)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, str]:
-        return self.input_ids[index], self.labels[index]
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int]:
+        return self.input_ids[index], self.attention_mask[index], self.label_ids[index]
