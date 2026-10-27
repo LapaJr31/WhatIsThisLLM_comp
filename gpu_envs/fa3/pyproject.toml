@@ -10,6 +10,7 @@ dependencies = [
     "scikit-learn>=1.9.1",
     "scipy>=1.18.1",
     "transformers>=5.20.2",
+    "name-that-llm",
 
     "torch==2.11.0",
     "torchvision==0.26.0",
@@ -17,14 +18,6 @@ dependencies = [
     "flash-linear-attention[cuda]",
     "causal-conv1d==1.7.0+cu.13.0.torch.2.11",
 ]
-
-[project.scripts]
-name-that-llm = "name_that_llm:main"
-
-[build-system]
-requires = ["uv_build>=0.13.5,<0.14.0"]
-build-backend = "uv_build"
-
 
 [dependency-groups]
 dev = [
@@ -43,12 +36,16 @@ explicit = true
 prerelease = "allow"
 
 [tool.uv.sources]
+name-that-llm = { path = "../..", editable = true }
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 flash-attn-3 = { index = "astral-cu130" }
 causal-conv1d = { index = "astral-cu130" }
 
 [tool.uv]
+package = false
 override-dependencies = [
     "xformers; sys_platform == 'never'",
 ]
+
+

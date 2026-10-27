@@ -10,6 +10,7 @@ dependencies = [
     "scikit-learn>=1.9.1",
     "scipy>=1.18.1",
     "transformers>=5.20.2",
+    "name-that-llm",
 
     "torch==2.14.0",
     "torchvision==0.29.0",
@@ -35,6 +36,7 @@ explicit = true
 prerelease = "allow"
 
 [tool.uv.sources]
+name-that-llm = { path = "../..", editable = true }
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "fa4-v4.0.0.beta34" }
@@ -47,6 +49,7 @@ flash-attn-4 = [
 ]
 
 [tool.uv]
+package = false
 override-dependencies = [
     "xformers; sys_platform == 'never'",
 ]

@@ -2,11 +2,12 @@ from .dataset import LLMDataset
 from .model import BertClassifierLLM
 from .train import Trainer
 
-if __name__ == "__main__":
+def main() -> None:
     trainer = Trainer(
-        model = BertClassifierLLM(),
-        dataset = LLMDataset("train.parquet")
+        model=BertClassifierLLM(),
+        dataset=LLMDataset("train.parquet"),
     )
-    trainer.train(
-        epochs=5,
-    )
+    trainer.train(epochs=5)
+
+if __name__ == "__main__":
+    main()
