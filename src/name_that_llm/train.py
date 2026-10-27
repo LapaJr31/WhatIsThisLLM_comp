@@ -1,3 +1,6 @@
+from click.core import batch
+import time
+
 import torch
 import numpy as np
 import copy
@@ -10,10 +13,49 @@ from sklearn.model_selection import StratifiedKFold
 
 from torch import nn, optim
 from torch.utils.data import DataLoader, Subset
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data.sampler import Sampler
+from torch.optim.lr_scheduler import LambdaLR
 from pathlib import Path
 
-from typing import Any, cast
+from typing import Any, cast, Iterator
+
+
+class BucketBatchSampler(Sampler[list[int]]):
+    def __init__(self, lengths, batch_size, shuffle=True, seed=99):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+        order = np.argsort(lengths, kind="stable")
+        self.megabatches = [
+            order[i : i + batch_size * 50]
+            for i in range(0, len(order), batch_size * 50)
+        ]
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return (len(self.lengths) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = np.random.default_rng(self.seed + self.epoch)
+        batches = []
+        for mega in self.megabatches:
+            mega = mega.copy()
+            if self.shuffle:
+                perm = rng.permutation(len(mega))
+                mega = mega[perm]
+            for i in range(0, len(mega), self.batch_size):
+                batch = mega[i : i + self.batch_size]
+                if self.shuffle:
+                    batch = batch[rng.permutation(len(batch))]
+                batches.append(batch.tolist())
+        if self.shuffle:
+            rng.shuffle(batches)
+        return iter(batches)
 
 class Trainer:
     def __init__(
@@ -25,9 +67,10 @@ class Trainer:
     ):
 
         self.checkpoint = checkpoint_dir
+        self.seed = seed
         Path(checkpoint_dir).parent.mkdir(parents=True, exist_ok=True)
-        self.log_every = 10
-        self.early_stop = 100
+        self.log_every = 1
+        self.early_stop = 20
 
         torch.manual_seed(seed)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -46,11 +89,15 @@ class Trainer:
             self.model = self.base_model
 
         self.dataset = dataset
+        self._probe_opt = None
         self.batch_size = self.max_batch(self.probe_batch)
+        torch.cuda.synchronize()
+        print(f"\nBest batch size = {self.batch_size}\n")
 
         self.skf = StratifiedKFold(n_splits=3, random_state=seed, shuffle=True)
 
-    def max_batch(self, probe, limit=4096):
+    def max_batch(self, probe, limit=4096, safety=0.75):
+        limit = min(limit, len(self.dataset))
         if not self._probe_safe(probe, 1):
             raise RuntimeError("model cannot fit even a single sample")
         if self._probe_safe(probe, limit):
@@ -63,7 +110,17 @@ class Trainer:
                 lo = mid
             else:
                 hi = mid
-        return lo
+        return max(1, int(lo * safety))
+
+    @staticmethod
+    def make_scheduler(optimizer, warmup_steps, total_steps):
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return (step + 1) / warmup_steps
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.5 * (1.0 + np.cos(np.pi * progress))
+
+        return LambdaLR(optimizer, lr_lambda)
 
     def _probe_safe(self, probe, batch_size):
         try:
@@ -90,21 +147,31 @@ class Trainer:
             batch[2].to(self.device),
         )
 
+        if self._probe_opt is None:
+            self._probe_opt = torch.optim.AdamW(
+                (p for p in self.model.parameters() if p.requires_grad),
+                lr=1e-4,
+                fused=self.device.type == "cuda",
+            )
+
         self.model.train()
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
             logits = self.model(input_ids, attention_mask)
             loss = nn.functional.cross_entropy(logits, labels)
 
         loss.backward()
-        self.model.zero_grad(set_to_none=True)
+        self._probe_opt.step()
+        self._probe_opt.zero_grad(set_to_none=True)
 
         del batch, input_ids, attention_mask, labels, logits, loss
         torch.cuda.empty_cache()
 
     @staticmethod
-    def train_epoch(model, optimizer, loader, loss_fn, device, dtype):
+    def train_epoch(model, optimizer, loader, loss_fn, device, dtype, scheduler=None):
         model.train()
         total_loss, correct = 0, 0
+        steps = 0
+        start = time.perf_counter()
         for input_ids, attention_mask, y in loader:
             input_ids = input_ids.to(device)
             attention_mask = attention_mask.to(device)
@@ -115,10 +182,19 @@ class Trainer:
                 loss = loss_fn(logits, y)
             loss.backward()
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            steps += 1
             total_loss += loss.item() * y.size(0)
             correct += (logits.argmax(1) == y).sum().item()
+        elapsed = time.perf_counter() - start
         n = len(loader.dataset)
-        return total_loss / n, correct / n
+        stats = {
+            "steps": steps,
+            "sec_per_step": elapsed / steps if steps else 0.0,
+            "samples_per_sec": n / elapsed if elapsed else 0.0,
+        }
+        return total_loss / n, correct / n, stats
 
     @staticmethod
     def evaluate(model, loader, device, loss_fn, dtype):
@@ -173,36 +249,53 @@ class Trainer:
             train_ds = Subset(self.dataset, train_index)
             test_ds = Subset (self.dataset, test_index)
 
+            train_batch_sampler = BucketBatchSampler(
+                self.dataset.lengths[train_index],
+                batch_size=64,
+                shuffle=True,
+                seed=self.seed + i,
+            )
             train_loader = DataLoader(
                 dataset = train_ds,
-                batch_size=self.batch_size,
-                shuffle=True,
+                batch_sampler=train_batch_sampler,
                 pin_memory=True,
                 num_workers=4,
             )
             test_loader = DataLoader(
                 test_ds,
-                batch_size=self.batch_size,
+                # batch_size=self.batch_size,
+                batch_size=64,
                 shuffle=False,
                 pin_memory=True,
                 num_workers=4,
             )
 
-            print(f"\n{'='*55}")
+            print(f"\n{'='*80}")
             print(
-                f"FOLD {i}/3 -- train {len(train_index)} | val {len(test_index)}"
+                f"FOLD {i+1}/3 -- train {len(train_index)} | val {len(test_index)}"
             )
-            print(f"\n{'='*55}")
+            print(f"\n{'='*80}")
 
             model = copy.deepcopy(self.base_model).to(self.device)
 
-            loss_fn = nn.CrossEntropyLoss()
+            loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+            head_params = list(model.classifier_head.parameters())
+            head_ids = {id(p) for p in head_params}
+            encoder_params = [p for p in model.parameters() if p.requires_grad and id(p) not in head_ids]
             optimizer = torch.optim.AdamW(
-                (p for p in model.parameters() if p.requires_grad),
-                lr=1e-4,
+                [
+                    {"params": encoder_params, "lr": 2e-5},
+                    {"params": head_params, "lr": 1e-3},
+                ],
                 fused=self.device.type == "cuda",
+                weight_decay=0.1,
             )
-            scheduler = ReduceLROnPlateau(optimizer,patience=10)
+
+            steps_per_epoch = len(train_batch_sampler)
+            total_steps = steps_per_epoch * epochs
+            warmup_steps = max(1, int(0.06 * total_steps))
+            scheduler = self.make_scheduler(optimizer, warmup_steps, total_steps)
 
             best_val_acc = 0.0
             best_epoch = 0
@@ -211,20 +304,23 @@ class Trainer:
             no_improve = 0
 
             print(
-            f"  {'Epoch':>5} | {'Tr Loss':>8} | {'Tr Acc':>7} | {'Va Loss':>8} | {'Va Acc':>7}"
+            f"  {'Epoch':>5} | {'Tr Loss':>8} | {'Tr Acc':>7} | {'Va Loss':>8} | {'Va Acc':>7} | "
+            f"{'Steps':>4} | {'s/step':>6} | {'samp/s':>7}"
             )
-            print(f"  {'-' * 50}")
+            print(f"  {'-' * 78}")
 
             history = {"tr_loss": [], "tr_acc": [], "va_loss": [], "va_acc": []}
 
             for epoch in range(1,epochs +1):
-                tr_loss, tr_acc = self.train_epoch(
+                train_batch_sampler.set_epoch(epoch)
+                tr_loss, tr_acc, timing = self.train_epoch(
                     model=model,
                     optimizer=optimizer,
                     loader=train_loader,
                     loss_fn=loss_fn,
                     device=self.device,
                     dtype=self.dtype,
+                    scheduler=scheduler,
                 )
                 va_loss, va_acc = self.evaluate(
                     model=model,
@@ -233,7 +329,6 @@ class Trainer:
                     device=self.device,
                     dtype=self.dtype,
                 )
-                scheduler.step(va_loss)
                 history["tr_loss"].append(tr_loss)
                 history["tr_acc"].append(tr_acc)
                 history["va_loss"].append(va_loss)
@@ -267,10 +362,12 @@ class Trainer:
                 else:
                     no_improve += 1
 
-                if epoch % self.log_every == 0 or epoch == 1:
+                if epoch % self.log_every == 0 or epoch == 1 or epoch == epochs:
                     print(
                         f"  {epoch:>5} | {tr_loss:>8.4f} | {tr_acc:>7.3%} | "
-                        f"{va_loss:>8.4f} | {va_acc:>7.3%}"
+                        f"{va_loss:>8.4f} | {va_acc:>7.3%} | "
+                        f"{timing['steps']:>4} steps | {timing['sec_per_step']:>6.3f} s/step | "
+                        f"{timing['samples_per_sec']:>7.1f} samp/s"
                         + ("  *" if no_improve == 0 else "")
                     )
 
@@ -295,11 +392,15 @@ class Trainer:
             for line in report.splitlines():
                 print(f"    {line}")
 
-            print(f"\n  Confusion matrix (rows=true, cols=pred):")
-            header = "    " + " ".join(f"{name[:8]:>8}" for name in self.dataset.label_names)
+            print(f"\n  Label map:")
+            for idx, name in enumerate(self.dataset.label_names):
+                print(f"    {idx:>3} = {name}")
+
+            print(f"\n  Confusion matrix (rows=true, cols=pred, ids from label map):")
+            header = "    " + " ".join(f"{idx:>4}" for idx in range(len(self.dataset.label_names)))
             print(header)
-            for name, row in zip(self.dataset.label_names, cm):
-                print(f"    {name[:8]:>8} " + " ".join(f"{v:>8}" for v in row))
+            for idx, row in enumerate(cm):
+                print(f"    {idx:>3} " + " ".join(f"{v:>4}" for v in row))
 
             fold_results.append((i, best_val_acc, auc))
             best_epochs.append(best_epoch)

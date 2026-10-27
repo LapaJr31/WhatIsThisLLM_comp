@@ -5,7 +5,7 @@ from transformers import AutoModel
 
 class BertClassifierLLM(nn.Module):
     def __init__(self,
-        model_id="answerdotai/ModernBERT-base",
+        model_id="answerdotai/ModernBERT-large",
         num_labels=18,
         dropout=0.1,
         seed=99,
@@ -33,18 +33,39 @@ class BertClassifierLLM(nn.Module):
                 p.requires_grad = True
 
         hidden_size = self.encoder.config.hidden_size
+
+        conv_dim = hidden_size // 2
+        self.conv = nn.Sequential(
+            nn.Conv1d(hidden_size, conv_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(conv_dim, conv_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+
+        feat_dim = conv_dim * 2 + hidden_size
         self.classifier_head = nn.Sequential(
-            nn.LayerNorm(hidden_size * 2),
+            nn.LayerNorm(feat_dim),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size * 2, num_labels),
+            nn.Linear(feat_dim, 512),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(512, num_labels),
         )
 
     def forward(self, input_ids, attention_mask):
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         last_hidden = out.last_hidden_state
 
-        cls = last_hidden[:, 0]
         mask = attention_mask.unsqueeze(-1).to(last_hidden.dtype)
-        mean = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
 
-        return self.classifier_head(torch.cat([cls, mean], dim=-1))
+        tokens = (last_hidden * mask).transpose(1, 2)
+        conv_out = self.conv(tokens).transpose(1, 2)
+        conv_out = conv_out * mask
+
+        conv_mean = conv_out.sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        conv_max = conv_out.masked_fill(mask == 0, torch.finfo(conv_out.dtype).min).max(dim=1).values
+
+        raw_mean = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+
+        feats = torch.cat([conv_mean, conv_max, raw_mean], dim=-1)
+        return self.classifier_head(feats)

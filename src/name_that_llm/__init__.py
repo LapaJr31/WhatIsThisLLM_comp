@@ -7,7 +7,7 @@ def main() -> None:
         model=BertClassifierLLM(),
         dataset=LLMDataset("train.parquet"),
     )
-    trainer.train(epochs=5)
+    trainer.train(epochs=10)
 
 if __name__ == "__main__":
     main()
