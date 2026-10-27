@@ -8,8 +8,6 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
-    "catboost>=1.2.10",
-    "kagglehub>=1.0.3",
     "matplotlib>=3.11.2",
     "numpy>=2.5.4",
     "pandas>=3.1.0",
@@ -72,3 +70,6 @@ dev = [
     "ipykernel>=7.4.0",
     "ipywidgets>=8.1.9",
 ]
+
+[tool.uv.workspace]
+exclude = ["gpu-envs/*"]

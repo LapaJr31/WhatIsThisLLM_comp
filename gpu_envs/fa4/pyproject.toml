@@ -1,0 +1,52 @@
+[project]
+name = "test-gpu-fa4"
+version = "0.1.0"
+requires-python = "==3.13.*"
+dependencies = [
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.4",
+    "pandas>=3.1.0",
+    "pyarrow>=26.0.0",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.18.1",
+    "transformers>=5.20.2",
+
+    "torch==2.14.0",
+    "torchvision==0.29.0",
+    "flash-attn-4[cu13]",
+    "flash-linear-attention[cuda]",
+    "causal-conv1d==1.7.0+cu.13.0.torch.2.14",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "ipywidgets>=8.1.8",
+]
+
+[[tool.uv.index]]
+name = "astral-cu130"
+url = "https://wheels.astral.sh/simple/cu130/"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+prerelease = "allow"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "fa4-v4.0.0.beta34" }
+causal-conv1d = { index = "astral-cu130" }
+
+[tool.uv.extra-build-dependencies]
+flash-attn-4 = [
+    "torch",
+    "setuptools",
+]
+
+[tool.uv]
+override-dependencies = [
+    "xformers; sys_platform == 'never'",
+]
