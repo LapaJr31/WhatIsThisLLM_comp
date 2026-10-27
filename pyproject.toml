@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "matplotlib>=3.11.2",
+    "mlflow>=1.27.0",
     "numpy>=2.5.4",
     "pandas>=3.1.0",
     "pyarrow>=26.0.0",

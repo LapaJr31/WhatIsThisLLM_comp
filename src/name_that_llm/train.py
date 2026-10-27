@@ -1,4 +1,3 @@
-from click.core import batch
 import time
 
 import torch
@@ -7,6 +6,7 @@ import copy
 
 from .model import BertClassifierLLM
 from .dataset import LLMDataset
+from .tracking import session as tracking_session, fold as tracking_fold
 
 from sklearn.metrics import f1_score, confusion_matrix, roc_auc_score, classification_report
 from sklearn.model_selection import StratifiedKFold
@@ -245,166 +245,216 @@ class Trainer:
         fold_results = []
         best_epochs = []
         global_best = 0.0
-        for i, (train_index, test_index) in enumerate(self.skf.split(self.dataset, self.dataset.label_ids)):
-            train_ds = Subset(self.dataset, train_index)
-            test_ds = Subset (self.dataset, test_index)
 
-            train_batch_sampler = BucketBatchSampler(
-                self.dataset.lengths[train_index],
-                batch_size=64,
-                shuffle=True,
-                seed=self.seed + i,
-            )
-            train_loader = DataLoader(
-                dataset = train_ds,
-                batch_sampler=train_batch_sampler,
-                pin_memory=True,
-                num_workers=4,
-            )
-            test_loader = DataLoader(
-                test_ds,
-                # batch_size=self.batch_size,
-                batch_size=64,
-                shuffle=False,
-                pin_memory=True,
-                num_workers=4,
-            )
+        with tracking_session() as sess:
+            sess.log_params({
+                "model_id": self.base_model.encoder.config._name_or_path,
+                "batch_size": 64,
+                "encoder_lr": 2e-5,
+                "head_lr": 1e-3,
+                "label_smoothing": 0.1,
+                "weight_decay": 0.1,
+                "warmup_frac": 0.06,
+                "early_stop": self.early_stop,
+                "seed": self.seed,
+                "epochs": epochs,
+                "unfrozen_layers": self.base_model.unfrozen_layers,
+            })
 
-            print(f"\n{'='*80}")
-            print(
-                f"FOLD {i+1}/3 -- train {len(train_index)} | val {len(test_index)}"
-            )
-            print(f"\n{'='*80}")
-
-            model = copy.deepcopy(self.base_model).to(self.device)
-
-            loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
-
-            head_params = list(model.classifier_head.parameters())
-            head_ids = {id(p) for p in head_params}
-            encoder_params = [p for p in model.parameters() if p.requires_grad and id(p) not in head_ids]
-            optimizer = torch.optim.AdamW(
-                [
-                    {"params": encoder_params, "lr": 2e-5},
-                    {"params": head_params, "lr": 1e-3},
-                ],
-                fused=self.device.type == "cuda",
-                weight_decay=0.1,
-            )
-
-            steps_per_epoch = len(train_batch_sampler)
-            total_steps = steps_per_epoch * epochs
-            warmup_steps = max(1, int(0.06 * total_steps))
-            scheduler = self.make_scheduler(optimizer, warmup_steps, total_steps)
-
-            best_val_acc = 0.0
-            best_epoch = 0
-            fold_ckpt = Path(self.checkpoint).parent / f"fold{i}_best.pt"
-            torch.save(model.state_dict(), fold_ckpt)
-            no_improve = 0
-
-            print(
-            f"  {'Epoch':>5} | {'Tr Loss':>8} | {'Tr Acc':>7} | {'Va Loss':>8} | {'Va Acc':>7} | "
-            f"{'Steps':>4} | {'s/step':>6} | {'samp/s':>7}"
-            )
-            print(f"  {'-' * 78}")
-
-            history = {"tr_loss": [], "tr_acc": [], "va_loss": [], "va_acc": []}
-
-            for epoch in range(1,epochs +1):
-                train_batch_sampler.set_epoch(epoch)
-                tr_loss, tr_acc, timing = self.train_epoch(
-                    model=model,
-                    optimizer=optimizer,
-                    loader=train_loader,
-                    loss_fn=loss_fn,
-                    device=self.device,
-                    dtype=self.dtype,
-                    scheduler=scheduler,
+            for i, (train_index, test_index) in enumerate(self.skf.split(self.dataset, self.dataset.label_ids)):
+                fold_acc, fold_auc, fold_best_epoch = self._train_fold(
+                    sess, i, train_index, test_index, epochs
                 )
-                va_loss, va_acc = self.evaluate(
-                    model=model,
-                    loader=test_loader,
-                    loss_fn=loss_fn,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-                history["tr_loss"].append(tr_loss)
-                history["tr_acc"].append(tr_acc)
-                history["va_loss"].append(va_loss)
-                history["va_acc"].append(va_acc)
+                fold_results.append((i, fold_acc, fold_auc))
+                best_epochs.append(fold_best_epoch)
+                if fold_acc > global_best:
+                    global_best = fold_acc
 
-                if va_acc > best_val_acc:
-                    best_val_acc = va_acc
-                    best_epoch = epoch
-                    no_improve = 0
+            accs = [acc for _, acc, _ in fold_results]
+            aucs = [a for _, _, a in fold_results if not np.isnan(a)]
+            sess.log_summary({
+                "mean_val_acc": float(np.mean(accs)),
+                "std_val_acc": float(np.std(accs)),
+                "mean_auc": float(np.mean(aucs)) if aucs else float("nan"),
+                "global_best_acc": global_best,
+            })
 
-                    torch.save(
-                        {
-                            "fold": i,
-                            "epoch": epoch,
-                            "val_acc": va_acc,
-                            "model_state": model.state_dict(),
-                        },
-                        fold_ckpt,
-                    )
-                    if va_acc > global_best:
-                        global_best = va_acc
-                        torch.save(
-                            {
-                                "fold": i,
-                                "epoch": epoch,
-                                "val_acc": va_acc,
-                                "model_state": model.state_dict(),
-                            },
-                            self.checkpoint,
-                        )
-                else:
-                    no_improve += 1
+        self._print_summary(fold_results, best_epochs, global_best)
+        return fold_results, best_epochs, global_best
 
-                if epoch % self.log_every == 0 or epoch == 1 or epoch == epochs:
-                    print(
-                        f"  {epoch:>5} | {tr_loss:>8.4f} | {tr_acc:>7.3%} | "
-                        f"{va_loss:>8.4f} | {va_acc:>7.3%} | "
-                        f"{timing['steps']:>4} steps | {timing['sec_per_step']:>6.3f} s/step | "
-                        f"{timing['samples_per_sec']:>7.1f} samp/s"
-                        + ("  *" if no_improve == 0 else "")
-                    )
+    def _train_fold(self, sess, i, train_index, test_index, epochs):
+        with tracking_fold(sess.run_id, i) as tr:
+            return self._train_fold_inner(tr, i, train_index, test_index, epochs)
 
-                if no_improve >= self.early_stop:
-                    print(
-                        f"\n  Early stop at epoch {epoch} (no improvement for {self.early_stop} epochs)"
-                    )
-                    break
+    def _train_fold_inner(self, tr, i, train_index, test_index, epochs):
+        train_ds = Subset(self.dataset, train_index)
+        test_ds = Subset (self.dataset, test_index)
 
-            ckpt = torch.load(fold_ckpt, map_location=self.device, weights_only=True)
-            model.load_state_dict(ckpt["model_state"])
-            report, cm, auc = self.eval_metrics(
+        train_batch_sampler = BucketBatchSampler(
+            self.dataset.lengths[train_index],
+            batch_size=64,
+            shuffle=True,
+            seed=self.seed + i,
+        )
+        train_loader = DataLoader(
+            dataset = train_ds,
+            batch_sampler=train_batch_sampler,
+            pin_memory=True,
+            num_workers=4,
+        )
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=64,
+            shuffle=False,
+            pin_memory=True,
+            num_workers=4,
+        )
+
+        print(f"\n{'='*80}")
+        print(
+            f"FOLD {i+1}/3 -- train {len(train_index)} | val {len(test_index)}"
+        )
+        print(f"\n{'='*80}")
+
+        model = copy.deepcopy(self.base_model).to(self.device)
+
+        loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+        head_params = list(model.classifier_head.parameters())
+        head_ids = {id(p) for p in head_params}
+        encoder_params = [p for p in model.parameters() if p.requires_grad and id(p) not in head_ids]
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": encoder_params, "lr": 2e-5},
+                {"params": head_params, "lr": 1e-3},
+            ],
+            fused=self.device.type == "cuda",
+            weight_decay=0.1,
+        )
+
+        steps_per_epoch = len(train_batch_sampler)
+        total_steps = steps_per_epoch * epochs
+        warmup_steps = max(1, int(0.06 * total_steps))
+        scheduler = self.make_scheduler(optimizer, warmup_steps, total_steps)
+
+        best_val_acc = 0.0
+        best_epoch = 0
+        fold_ckpt = Path(self.checkpoint).parent / f"fold{i}_best.pt"
+        torch.save(model.state_dict(), fold_ckpt)
+        no_improve = 0
+
+        print(
+        f"  {'Epoch':>5} | {'Tr Loss':>8} | {'Tr Acc':>7} | {'Va Loss':>8} | {'Va Acc':>7} | "
+        f"{'Steps':>4} | {'s/step':>6} | {'samp/s':>7}"
+        )
+        print(f"  {'-' * 78}")
+
+        history = {"tr_loss": [], "tr_acc": [], "va_loss": [], "va_acc": []}
+
+        for epoch in range(1, epochs + 1):
+            train_batch_sampler.set_epoch(epoch)
+            tr_loss, tr_acc, timing = self.train_epoch(
+                model=model,
+                optimizer=optimizer,
+                loader=train_loader,
+                loss_fn=loss_fn,
+                device=self.device,
+                dtype=self.dtype,
+                scheduler=scheduler,
+            )
+            va_loss, va_acc = self.evaluate(
                 model=model,
                 loader=test_loader,
+                loss_fn=loss_fn,
                 device=self.device,
                 dtype=self.dtype,
             )
+            history["tr_loss"].append(tr_loss)
+            history["tr_acc"].append(tr_acc)
+            history["va_loss"].append(va_loss)
+            history["va_acc"].append(va_acc)
+            tr.log_epoch(epoch, {
+                "tr_loss": tr_loss, "tr_acc": tr_acc,
+                "va_loss": va_loss, "va_acc": va_acc,
+                "sec_per_step": timing["sec_per_step"],
+            })
 
-            print(f"\n  Best val acc : {best_val_acc:.3%}  (epoch {best_epoch})")
-            print(f"  ROC-AUC (OvR macro) : {auc:.4f}")
-            print(f"\n  Classification report:\n")
-            for line in report.splitlines():
-                print(f"    {line}")
+            if va_acc > best_val_acc:
+                best_val_acc = va_acc
+                best_epoch = epoch
+                no_improve = 0
 
-            print(f"\n  Label map:")
-            for idx, name in enumerate(self.dataset.label_names):
-                print(f"    {idx:>3} = {name}")
+                torch.save(
+                    {
+                        "fold": i,
+                        "epoch": epoch,
+                        "val_acc": va_acc,
+                        "model_state": model.state_dict(),
+                    },
+                    fold_ckpt,
+                )
+            else:
+                no_improve += 1
 
-            print(f"\n  Confusion matrix (rows=true, cols=pred, ids from label map):")
-            header = "    " + " ".join(f"{idx:>4}" for idx in range(len(self.dataset.label_names)))
-            print(header)
-            for idx, row in enumerate(cm):
-                print(f"    {idx:>3} " + " ".join(f"{v:>4}" for v in row))
+            if epoch % self.log_every == 0 or epoch == 1 or epoch == epochs:
+                print(
+                    f"  {epoch:>5} | {tr_loss:>8.4f} | {tr_acc:>7.3%} | "
+                    f"{va_loss:>8.4f} | {va_acc:>7.3%} | "
+                    f"{timing['steps']:>4} steps | {timing['sec_per_step']:>6.3f} s/step | "
+                    f"{timing['samples_per_sec']:>7.1f} samp/s"
+                    + ("  *" if no_improve == 0 else "")
+                )
 
-            fold_results.append((i, best_val_acc, auc))
-            best_epochs.append(best_epoch)
+            if no_improve >= self.early_stop:
+                print(
+                    f"\n  Early stop at epoch {epoch} (no improvement for {self.early_stop} epochs)"
+                )
+                break
 
+        ckpt = torch.load(fold_ckpt, map_location=self.device, weights_only=True)
+        model.load_state_dict(ckpt["model_state"])
+        report, cm, auc = self.eval_metrics(
+            model=model,
+            loader=test_loader,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        print(f"\n  Best val acc : {best_val_acc:.3%}  (epoch {best_epoch})")
+        print(f"  ROC-AUC (OvR macro) : {auc:.4f}")
+        print(f"\n  Classification report:\n")
+        for line in report.splitlines():
+            print(f"    {line}")
+
+        print(f"\n  Label map:")
+        for idx, name in enumerate(self.dataset.label_names):
+            print(f"    {idx:>3} = {name}")
+
+        print(f"\n  Confusion matrix (rows=true, cols=pred, ids from label map):")
+        header = "    " + " ".join(f"{idx:>4}" for idx in range(len(self.dataset.label_names)))
+        print(header)
+        for idx, row in enumerate(cm):
+            print(f"    {idx:>3} " + " ".join(f"{v:>4}" for v in row))
+
+        tr.log_summary({"best_val_acc": best_val_acc, "auc": auc, "best_epoch": best_epoch})
+        tr.log_artifact_text(
+            "classification_report.txt",
+            report + "\n\n" + "\n".join(
+                f"{idx:>3} = {name}"
+                for idx, name in enumerate(self.dataset.label_names)
+            ),
+        )
+        tr.log_artifact_text(
+            "confusion_matrix.csv",
+            "true/pred," + ",".join(self.dataset.label_names) + "\n"
+            + "\n".join(
+                f"{self.dataset.label_names[r]}," + ",".join(str(int(v)) for v in row)
+                for r, row in enumerate(cm)
+            ),
+        )
+        return best_val_acc, auc, best_epoch
+
+    def _print_summary(self, fold_results, best_epochs, global_best):
         accs = [acc for _, acc, _ in fold_results]
         aucs = [a for _, _, a in fold_results if not np.isnan(a)]
 
@@ -418,5 +468,3 @@ class Trainer:
         if aucs:
             print(f"  mean auc : {np.mean(aucs):.4f} ± {np.std(aucs):.4f}")
         print(f"  global best acc : {global_best:.3%} (saved to {self.checkpoint})")
-
-        return fold_results, best_epochs, global_best

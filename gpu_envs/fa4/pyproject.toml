@@ -10,6 +10,7 @@ dependencies = [
     "scikit-learn>=1.9.1",
     "scipy>=1.18.1",
     "transformers>=5.20.2",
+    "mlflow>=1.27.0",
     "name-that-llm",
 
     "torch==2.14.0",
