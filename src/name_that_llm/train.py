@@ -45,8 +45,6 @@ class Trainer:
         else:
             self.model = self.base_model
 
-
-
         self.dataset = dataset
         self.batch_size = self.max_batch(self.probe_batch)
 
@@ -167,24 +165,24 @@ class Trainer:
 
         return report, cm, auc
 
-    def train(self, epochs, dataset, batch_size):
+    def train(self, epochs):
         fold_results = []
         best_epochs = []
         global_best = 0.0
-        for i, (train_index, test_index) in enumerate(self.skf.split(dataset, dataset.label_ids)):
-            train_ds = Subset(dataset, train_index)
-            test_ds = Subset (dataset, test_index)
+        for i, (train_index, test_index) in enumerate(self.skf.split(self.dataset, self.dataset.label_ids)):
+            train_ds = Subset(self.dataset, train_index)
+            test_ds = Subset (self.dataset, test_index)
 
             train_loader = DataLoader(
                 dataset = train_ds,
-                batch_size=batch_size,
+                batch_size=self.batch_size,
                 shuffle=True,
                 pin_memory=True,
                 num_workers=4,
             )
             test_loader = DataLoader(
                 test_ds,
-                batch_size=batch_size,
+                batch_size=self.batch_size,
                 shuffle=False,
                 pin_memory=True,
                 num_workers=4,
@@ -298,9 +296,9 @@ class Trainer:
                 print(f"    {line}")
 
             print(f"\n  Confusion matrix (rows=true, cols=pred):")
-            header = "    " + " ".join(f"{name[:8]:>8}" for name in dataset.label_names)
+            header = "    " + " ".join(f"{name[:8]:>8}" for name in self.dataset.label_names)
             print(header)
-            for name, row in zip(dataset.label_names, cm):
+            for name, row in zip(self.dataset.label_names, cm):
                 print(f"    {name[:8]:>8} " + " ".join(f"{v:>8}" for v in row))
 
             fold_results.append((i, best_val_acc, auc))
