@@ -14,6 +14,7 @@ class BertClassifierLLM(nn.Module):
     ):
         super().__init__()
         torch.manual_seed(seed)
+        self.unfrozen_layers = unfrozen_layers
 
         self.encoder = AutoModel.from_pretrained(
             model_id,

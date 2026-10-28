@@ -2,16 +2,15 @@ import time
 
 import torch
 import numpy as np
-import copy
 
 from .model import BertClassifierLLM
 from .dataset import LLMDataset
 from .tracking import session as tracking_session, fold as tracking_fold
 
-from sklearn.metrics import f1_score, confusion_matrix, roc_auc_score, classification_report
+from sklearn.metrics import confusion_matrix, roc_auc_score, classification_report
 from sklearn.model_selection import StratifiedKFold
 
-from torch import nn, optim
+from torch import nn
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.sampler import Sampler
 from torch.optim.lr_scheduler import LambdaLR
@@ -82,35 +81,10 @@ class Trainer:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
-            # test reduce_overhead afterwards
-            self.model = torch.compile(self.base_model, mode="default")
-            torch.cuda.synchronize()
-        else:
-            self.model = self.base_model
-
         self.dataset = dataset
-        self._probe_opt = None
-        self.batch_size = self.max_batch(self.probe_batch)
-        torch.cuda.synchronize()
-        print(f"\nBest batch size = {self.batch_size}\n")
+        self._init_state = None
 
         self.skf = StratifiedKFold(n_splits=3, random_state=seed, shuffle=True)
-
-    def max_batch(self, probe, limit=4096, safety=0.75):
-        limit = min(limit, len(self.dataset))
-        if not self._probe_safe(probe, 1):
-            raise RuntimeError("model cannot fit even a single sample")
-        if self._probe_safe(probe, limit):
-            return limit
-
-        lo, hi = 1, limit
-        while lo < hi - 1:
-            mid = (lo + hi) // 2
-            if self._probe_safe(probe, mid):
-                lo = mid
-            else:
-                hi = mid
-        return max(1, int(lo * safety))
 
     @staticmethod
     def make_scheduler(optimizer, warmup_steps, total_steps):
@@ -121,50 +95,6 @@ class Trainer:
             return 0.5 * (1.0 + np.cos(np.pi * progress))
 
         return LambdaLR(optimizer, lr_lambda)
-
-    def _probe_safe(self, probe, batch_size):
-        try:
-            probe(batch_size)
-            torch.cuda.synchronize(self.device)
-            return True
-        except torch.cuda.OutOfMemoryError:
-            return False
-        finally:
-            torch.cuda.empty_cache()
-
-    def probe_batch(self, batch_size):
-        probe_dl = DataLoader(
-            dataset=self.dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True,
-        )
-        batch = next(iter(probe_dl))
-        input_ids, attention_mask, labels = (
-            batch[0].to(self.device),
-            batch[1].to(self.device),
-            batch[2].to(self.device),
-        )
-
-        if self._probe_opt is None:
-            self._probe_opt = torch.optim.AdamW(
-                (p for p in self.model.parameters() if p.requires_grad),
-                lr=1e-4,
-                fused=self.device.type == "cuda",
-            )
-
-        self.model.train()
-        with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-            logits = self.model(input_ids, attention_mask)
-            loss = nn.functional.cross_entropy(logits, labels)
-
-        loss.backward()
-        self._probe_opt.step()
-        self._probe_opt.zero_grad(set_to_none=True)
-
-        del batch, input_ids, attention_mask, labels, logits, loss
-        torch.cuda.empty_cache()
 
     @staticmethod
     def train_epoch(model, optimizer, loader, loss_fn, device, dtype, scheduler=None):
@@ -242,11 +172,13 @@ class Trainer:
         return report, cm, auc
 
     def train(self, epochs):
+        print("\nTraining!", flush=True)
         fold_results = []
         best_epochs = []
         global_best = 0.0
 
         with tracking_session() as sess:
+            print("  tracking session ready", flush=True)
             sess.log_params({
                 "model_id": self.base_model.encoder.config._name_or_path,
                 "batch_size": 64,
@@ -261,7 +193,11 @@ class Trainer:
                 "unfrozen_layers": self.base_model.unfrozen_layers,
             })
 
-            for i, (train_index, test_index) in enumerate(self.skf.split(self.dataset, self.dataset.label_ids)):
+            print("  computing CV splits...", flush=True)
+            splits = list(self.skf.split(self.dataset, self.dataset.label_ids))
+            print(f"  {len(splits)} folds ready", flush=True)
+
+            for i, (train_index, test_index) in enumerate(splits):
                 fold_acc, fold_auc, fold_best_epoch = self._train_fold(
                     sess, i, train_index, test_index, epochs
                 )
@@ -310,13 +246,24 @@ class Trainer:
             num_workers=4,
         )
 
-        print(f"\n{'='*80}")
+        print(f"\n{'='*80}", flush=True)
         print(
-            f"FOLD {i+1}/3 -- train {len(train_index)} | val {len(test_index)}"
+            f"FOLD {i+1}/3 -- train {len(train_index)} | val {len(test_index)}",
+            flush=True,
         )
-        print(f"\n{'='*80}")
+        print(f"\n{'='*80}", flush=True)
 
-        model = copy.deepcopy(self.base_model).to(self.device)
+        if self._init_state is None:
+            self._init_state = {
+                k: v.detach().cpu().clone() for k, v in self.base_model.state_dict().items()
+            }
+        model = self.base_model
+        model.load_state_dict(self._init_state)
+
+        compiled = None
+        if self.device.type == "cuda":
+            print("  compiling model for this fold...", flush=True)
+            compiled = torch.compile(model)
 
         loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
 
@@ -345,16 +292,15 @@ class Trainer:
 
         print(
         f"  {'Epoch':>5} | {'Tr Loss':>8} | {'Tr Acc':>7} | {'Va Loss':>8} | {'Va Acc':>7} | "
-        f"{'Steps':>4} | {'s/step':>6} | {'samp/s':>7}"
+        f"{'Steps':>4} | {'s/step':>6} | {'samp/s':>7}",
+        flush=True,
         )
-        print(f"  {'-' * 78}")
-
-        history = {"tr_loss": [], "tr_acc": [], "va_loss": [], "va_acc": []}
+        print(f"  {'-' * 78}", flush=True)
 
         for epoch in range(1, epochs + 1):
             train_batch_sampler.set_epoch(epoch)
             tr_loss, tr_acc, timing = self.train_epoch(
-                model=model,
+                model=compiled if compiled is not None else model,
                 optimizer=optimizer,
                 loader=train_loader,
                 loss_fn=loss_fn,
@@ -363,16 +309,12 @@ class Trainer:
                 scheduler=scheduler,
             )
             va_loss, va_acc = self.evaluate(
-                model=model,
+                model=compiled if compiled is not None else model,
                 loader=test_loader,
                 loss_fn=loss_fn,
                 device=self.device,
                 dtype=self.dtype,
             )
-            history["tr_loss"].append(tr_loss)
-            history["tr_acc"].append(tr_acc)
-            history["va_loss"].append(va_loss)
-            history["va_acc"].append(va_acc)
             tr.log_epoch(epoch, {
                 "tr_loss": tr_loss, "tr_acc": tr_acc,
                 "va_loss": va_loss, "va_acc": va_acc,
@@ -389,7 +331,7 @@ class Trainer:
                         "fold": i,
                         "epoch": epoch,
                         "val_acc": va_acc,
-                        "model_state": model.state_dict(),
+                        "model_state": model.state_dict(),  # raw module: no _orig_mod prefix
                     },
                     fold_ckpt,
                 )
@@ -402,39 +344,41 @@ class Trainer:
                     f"{va_loss:>8.4f} | {va_acc:>7.3%} | "
                     f"{timing['steps']:>4} steps | {timing['sec_per_step']:>6.3f} s/step | "
                     f"{timing['samples_per_sec']:>7.1f} samp/s"
-                    + ("  *" if no_improve == 0 else "")
+                    + ("  *" if no_improve == 0 else ""),
+                    flush=True,
                 )
 
             if no_improve >= self.early_stop:
                 print(
-                    f"\n  Early stop at epoch {epoch} (no improvement for {self.early_stop} epochs)"
+                    f"\n  Early stop at epoch {epoch} (no improvement for {self.early_stop} epochs)",
+                    flush=True,
                 )
                 break
 
         ckpt = torch.load(fold_ckpt, map_location=self.device, weights_only=True)
         model.load_state_dict(ckpt["model_state"])
         report, cm, auc = self.eval_metrics(
-            model=model,
+            model=compiled if compiled is not None else model,
             loader=test_loader,
             device=self.device,
             dtype=self.dtype,
         )
 
-        print(f"\n  Best val acc : {best_val_acc:.3%}  (epoch {best_epoch})")
-        print(f"  ROC-AUC (OvR macro) : {auc:.4f}")
-        print(f"\n  Classification report:\n")
+        print(f"\n  Best val acc : {best_val_acc:.3%}  (epoch {best_epoch})", flush=True)
+        print(f"  ROC-AUC (OvR macro) : {auc:.4f}", flush=True)
+        print(f"\n  Classification report:\n", flush=True)
         for line in report.splitlines():
-            print(f"    {line}")
+            print(f"    {line}", flush=True)
 
-        print(f"\n  Label map:")
+        print(f"\n  Label map:", flush=True)
         for idx, name in enumerate(self.dataset.label_names):
-            print(f"    {idx:>3} = {name}")
+            print(f"    {idx:>3} = {name}", flush=True)
 
-        print(f"\n  Confusion matrix (rows=true, cols=pred, ids from label map):")
+        print(f"\n  Confusion matrix (rows=true, cols=pred, ids from label map):", flush=True)
         header = "    " + " ".join(f"{idx:>4}" for idx in range(len(self.dataset.label_names)))
-        print(header)
+        print(header, flush=True)
         for idx, row in enumerate(cm):
-            print(f"    {idx:>3} " + " ".join(f"{v:>4}" for v in row))
+            print(f"    {idx:>3} " + " ".join(f"{v:>4}" for v in row), flush=True)
 
         tr.log_summary({"best_val_acc": best_val_acc, "auc": auc, "best_epoch": best_epoch})
         tr.log_artifact_text(
@@ -452,19 +396,23 @@ class Trainer:
                 for r, row in enumerate(cm)
             ),
         )
+        del optimizer
+        del compiled
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
         return best_val_acc, auc, best_epoch
 
     def _print_summary(self, fold_results, best_epochs, global_best):
         accs = [acc for _, acc, _ in fold_results]
         aucs = [a for _, _, a in fold_results if not np.isnan(a)]
 
-        print(f"\n{'='*55}")
-        print("CROSS-VALIDATION SUMMARY")
-        print(f"{'='*55}")
+        print(f"\n{'='*55}", flush=True)
+        print("CROSS-VALIDATION SUMMARY", flush=True)
+        print(f"{'='*55}", flush=True)
         for (fold, acc, auc), epoch in zip(fold_results, best_epochs):
-            print(f"  fold {fold}: acc {acc:.3%} | auc {auc:.4f} | best epoch {epoch}")
-        print(f"  {'-' * 50}")
-        print(f"  mean acc : {np.mean(accs):.3%} ± {np.std(accs):.3%}")
+            print(f"  fold {fold}: acc {acc:.3%} | auc {auc:.4f} | best epoch {epoch}", flush=True)
+        print(f"  {'-' * 50}", flush=True)
+        print(f"  mean acc : {np.mean(accs):.3%} ± {np.std(accs):.3%}", flush=True)
         if aucs:
-            print(f"  mean auc : {np.mean(aucs):.4f} ± {np.std(aucs):.4f}")
-        print(f"  global best acc : {global_best:.3%} (saved to {self.checkpoint})")
+            print(f"  mean auc : {np.mean(aucs):.4f} ± {np.std(aucs):.4f}", flush=True)
+        print(f"  global best acc : {global_best:.3%} (saved to {self.checkpoint})", flush=True)
