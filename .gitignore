@@ -11,3 +11,8 @@ wheels/
 mlflow.db
 thinklapka.tail16a3f8.ts.net.crt
 thinklapka.tail16a3f8.ts.net.key
+.env
+0-663-0-660-v31-atlas-20.ipynb
+
+dataset/*
+src/data_pull/build_corpus.py
